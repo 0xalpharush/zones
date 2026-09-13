@@ -142,6 +142,7 @@ against TIP-20 movements and exact post-block state.
 
 Activity logs contain only the fields needed by log-backed activity dashboards:
 
+- `activity_schema_version`: `1`, used by dashboards to select supported activity logs.
 - `activity_event`: the stable event name from the table below.
 - `activity_id`: `v<schema_version>:<zone_hash>:<activity_source>:<activity_index>`,
   which remains stable if recovery replays the same canonical block under the
@@ -150,7 +151,7 @@ Activity logs contain only the fields needed by log-backed activity dashboards:
 - `callback_success`: emitted only for `portal_withdrawal_processed`, allowing
   dashboards to distinguish successful and failed withdrawal callbacks.
 
-The ID components are not repeated as separate fields. Activity logs omit
+Only the schema version is repeated from the ID as a separate field. Activity logs omit
 descriptive messages, block heights, Tempo hashes, token and account addresses,
 amounts, fees, and deposit/withdrawal numbers. Kubernetes pod and namespace
 metadata supplied by the log collector still identify the verifier and Zone.

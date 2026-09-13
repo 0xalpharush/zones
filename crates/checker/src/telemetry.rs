@@ -105,6 +105,7 @@ macro_rules! activity_log {
         let context = $context;
         tracing::info!(
             target: "zone::checker",
+            activity_schema_version = ACTIVITY_SCHEMA_VERSION,
             activity_event = $event,
             activity_id = %context.id(),
             $($fields)*
