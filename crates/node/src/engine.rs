@@ -436,8 +436,7 @@ impl ZoneEngine {
             eyre::bail!("Invalid post-newPayload fork choice update {forkchoice:?}: {result:?}");
         }
 
-        // Only consume the L1 input and advance local role state after both the proof WAL and
-        // canonical forkchoice are durable/accepted.
+        // Consume the L1 input only after witness persistence and canonicalization succeed.
         self.deposit_queue.confirm(l1_num_hash)?;
         self.l1_block_tracker.prune_through(l1_num_hash.number);
         if let Some(permit) = &self.production_permit {

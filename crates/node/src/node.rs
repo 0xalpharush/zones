@@ -100,9 +100,8 @@ use zone_primitives::constants::{decode_l1_chain_id, zone_chain_id};
 use zone_rpc::ZoneDebugApiRpcServer;
 use zone_sequencer::{
     AttestationStore, BatchAnchorConfig, ProofCollectorConfig, ProofCollectorHandle,
-    ProofCollectorSettlement, ShadowProverConfig, WithdrawalBatchLimits, ZoneSequencerConfig,
-    attestation::AttestationDomain, spawn_proof_collector, spawn_shadow_prover,
-    spawn_zone_sequencer,
+    ShadowProverConfig, WithdrawalBatchLimits, ZoneSequencerConfig, attestation::AttestationDomain,
+    spawn_proof_collector, spawn_shadow_prover, spawn_zone_sequencer,
 };
 
 fn validate_zone_chain_id(parent_chain_id: u64, zone_id: u32, chain_id: u64) -> eyre::Result<()> {
@@ -828,30 +827,14 @@ where
 
         let proof_collector =
             if self.sequencer_config.is_some() || finalized_batch_submissions.is_some() {
-                // Batches settled by the startup Tempo checkpoint precede this node's
-                // shadow-proving scope, even if the live portal is further ahead.
-                let initial_processed_through = if effective_shadow_prover_config.is_some() {
-                    Some(u64::try_from(
-                        ZonePortal::new(self.portal_address, &l1_provider)
-                            .zoneHeight()
-                            .block(tempo_block_number.into())
-                            .call()
-                            .await?,
-                    )?)
-                } else {
-                    None
-                };
                 let proof_collector_config = ProofCollectorConfig {
                     directory: data_dir.join("proofs"),
                     debug_api: Arc::new(NodeZoneDebugApi::new(
                         handle.eth_handlers().api.clone(),
                         l1_provider.clone(),
                     )),
-                    settlement: ProofCollectorSettlement {
-                        portal_address: self.portal_address,
-                        l1_provider: l1_provider.clone(),
-                    },
-                    initial_processed_through,
+                    portal_address: self.portal_address,
+                    l1_provider: l1_provider.clone(),
                 };
                 let (collector, collector_task) = spawn_proof_collector(
                     proof_collector_config,
@@ -873,6 +856,10 @@ where
                     parent_chain_id: l1_chain_id,
                     zone_id: config.zone_id,
                     chain_spec: evm_chain_spec,
+                    debug_api: Arc::new(NodeZoneDebugApi::new(
+                        handle.eth_handlers().api.clone(),
+                        l1_provider.clone(),
+                    )),
                     prover_address: config
                         .prover_runtime
                         .remote_address()
