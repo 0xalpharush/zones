@@ -10,7 +10,7 @@ use crate::utils::start_real_p2p_cluster_with_active_nodes;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canonical_leader_block_has_durable_proof() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let cluster = start_real_p2p_cluster_with_active_nodes(120, 2).await?;
+    let mut cluster = start_real_p2p_cluster_with_active_nodes(120, 2).await?;
     let leader = &cluster.nodes[0];
     let mut canonical = leader.subscribe_to_canonical_state();
     let notification = tokio::time::timeout(Duration::from_secs(60), canonical.recv()).await??;
@@ -44,26 +44,24 @@ async fn canonical_leader_block_has_durable_proof() -> eyre::Result<()> {
     let retained = directory.with_file_name("proofs-retained");
     std::fs::rename(&directory, &retained)?;
     std::fs::File::create(&directory)?;
-    let provider = leader.provider();
-    let stalled_height = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let head = provider.get_block_number().await?;
-            if leader
-                .pending_block_number()?
-                .is_some_and(|number| number > head)
-            {
-                break eyre::Ok(head);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await??;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        provider.get_block_number().await?,
-        stalled_height,
-        "proof persistence failure must not advance canonical forkchoice"
-    );
+    let _exit = tokio::time::timeout(
+        Duration::from_secs(30),
+        cluster.nodes[0].wait_for_node_exit(),
+    )
+    .await
+    .expect("node must shut down after a proof-store mutation fails");
+
+    // A block already persisted when the fault was injected may still become canonical.
+    // Every such notification must have a proof in the retained spool.
+    while let Ok(notification) = canonical.try_recv() {
+        let tip = notification.tip();
+        assert!(
+            retained
+                .join(format!("{}-{:x}.json", tip.number(), tip.hash()))
+                .is_file(),
+            "proof persistence failure must not canonicalize a block without a durable proof"
+        );
+    }
     std::fs::remove_file(&directory)?;
     std::fs::rename(&retained, &directory)?;
     Ok(())

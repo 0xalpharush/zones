@@ -441,10 +441,11 @@ async fn handle_test_l1_rpc_request(
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
-/// Answers a [`ZonePortal`] enabled-token view call against the mock registry, either issued
-/// directly or as an inner call of a Multicall3 `aggregate` batch.
+/// Answers portal view calls directly or within a Multicall3 batch.
 fn answer_portal_call(input: &[u8], enabled_tokens: &[Address]) -> Option<Vec<u8>> {
-    if input.starts_with(&ZonePortal::enabledTokenCountCall::SELECTOR) {
+    if input.starts_with(&ZonePortal::zoneHeightCall::SELECTOR) {
+        Some(U256::ZERO.abi_encode())
+    } else if input.starts_with(&ZonePortal::enabledTokenCountCall::SELECTOR) {
         Some(U256::from(enabled_tokens.len()).abi_encode())
     } else if input.starts_with(&ZonePortal::enabledTokenAtCall::SELECTOR) {
         let index = input.get(4..36).map(U256::from_be_slice)?.to::<u64>() as usize;
@@ -616,7 +617,6 @@ pub(crate) fn seed_raw_tip403_policy(
 
 pub(crate) trait TestNodeHandle: Send {
     fn proof_directory(&self) -> std::path::PathBuf;
-    fn pending_block_number(&self) -> eyre::Result<Option<u64>>;
     fn subscribe_to_canonical_state(
         &self,
     ) -> reth_provider::CanonStateNotifications<tempo_primitives::TempoPrimitives>;
@@ -639,16 +639,6 @@ where
 {
     fn proof_directory(&self) -> std::path::PathBuf {
         self.node.data_dir.data_dir().join("proofs")
-    }
-
-    fn pending_block_number(&self) -> eyre::Result<Option<u64>> {
-        use alloy_consensus::BlockHeader as _;
-        use reth_provider::BlockReader as _;
-        Ok(self
-            .node
-            .provider()
-            .pending_block()?
-            .map(|block| block.number()))
     }
 
     fn subscribe_to_canonical_state(
@@ -725,9 +715,6 @@ impl ZoneTestNode {
         self.node_handle.proof_directory()
     }
 
-    pub(crate) fn pending_block_number(&self) -> eyre::Result<Option<u64>> {
-        self.node_handle.pending_block_number()
-    }
     /// Returns the HTTP RPC URL for connecting providers to this node.
     pub(crate) fn http_url(&self) -> &url::Url {
         &self.http_url

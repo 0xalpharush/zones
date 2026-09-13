@@ -142,11 +142,13 @@ impl<P: ZoneSequencerProvider> ProofCollector<P> {
         let store = self.store.clone();
         let provider = self.provider.clone();
         let head = tokio::task::spawn_blocking(move || {
-            store.prune_through(finalized_zone_height)?;
+            store
+                .prune_through(finalized_zone_height)
+                .unwrap_or_else(|error| panic!("failed to prune block proofs: {error:#}"));
             Ok::<_, eyre::Report>(provider.best_block_number()?)
         })
         .await
-        .context("proof pruning task panicked")??;
+        .expect("proof pruning task panicked")?;
 
         let start = self.store.state.read().pruned_through.saturating_add(1);
         for number in start..=head {
@@ -173,7 +175,8 @@ impl<P: ZoneSequencerProvider> ProofCollector<P> {
             store.insert(proof)
         })
         .await
-        .context("proof persistence task panicked")??;
+        .expect("proof persistence task panicked")
+        .unwrap_or_else(|error| panic!("failed to persist block proof: {error:#}"));
         info!(
             target: "zone::sequencer::proofs",
             zone_block = number,

@@ -843,7 +843,7 @@ where
                 )
                 .await?;
                 task_executor.spawn_critical_task("zone-proof-collector", async move {
-                    let _ = collector_task.await;
+                    collector_task.await.expect("proof collector task failed");
                 });
                 Some(collector)
             } else {
