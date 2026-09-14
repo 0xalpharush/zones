@@ -73,6 +73,9 @@ const BLOCK_SIZE_SAFETY_MARGIN: usize = 1024 * 1024;
 const L1_STORAGE_UNAVAILABLE_ERROR_PREFIX: &str = "Tempo L1 storage unavailable";
 
 /// Payload L1 reader with a test-only unverified variant.
+///
+/// Deferred verification gates locally constructed payloads only. Import and ordinary replay use
+/// [`L1StateProvider`], while settlement and SPF verification remain an independent boundary.
 #[derive(Clone, Debug)]
 enum PayloadL1Reader {
     /// Deferred-verification reader used by production payload construction.
