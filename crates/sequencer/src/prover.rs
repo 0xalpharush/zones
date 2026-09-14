@@ -641,21 +641,6 @@ async fn verify_remotely(
     metrics
         .spf_remote_request_send_duration_seconds
         .record(started.elapsed().as_secs_f64());
-    let written_bytes = connection.last_send_written_bytes();
-    if let Err(error) = &send_result {
-        let request_bytes = connection.last_send_bytes();
-        warn!(
-            target: "zone::sequencer::prover",
-            request_id = %request.request_id,
-            zone_from = job.from,
-            zone_to = job.to,
-            request_bytes,
-            wire_bytes = request_bytes.map(|bytes| bytes + size_of::<u32>()),
-            written_bytes,
-            %error,
-            "Failed to send request to remote prover"
-        );
-    }
     let request_bytes =
         send_result.wrap_err_with(|| format!("send request to remote prover at {address}"))?;
     // ProverConnection uses a four-byte length prefix; TCP/IP overhead is excluded.
@@ -666,8 +651,6 @@ async fn verify_remotely(
         zone_to = job.to,
         request_bytes,
         wire_bytes = request_bytes + size_of::<u32>(),
-        // Bytes accepted by the socket, not confirmation of receipt by the prover.
-        written_bytes,
         "Sent request to remote prover"
     );
 

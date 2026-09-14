@@ -1,22 +1,17 @@
-use std::{
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::io;
 
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec, LengthDelimitedCodecError};
 
 use crate::{ErrorCode, PROTOCOL_VERSION, VerifyResponse};
 
 /// A typed connection using the prover's length-delimited JSON protocol.
 pub struct ProverConnection<T> {
-    inner: Framed<WriteCounted<T>, LengthDelimitedCodec>,
+    inner: Framed<T, LengthDelimitedCodec>,
     maximum: usize,
     last_received_bytes: Option<usize>,
-    last_send_bytes: Option<usize>,
 }
 
 impl<IO> ProverConnection<IO>
@@ -28,13 +23,9 @@ where
         Self {
             inner: LengthDelimitedCodec::builder()
                 .max_frame_length(maximum)
-                .new_framed(WriteCounted {
-                    inner: io,
-                    written: 0,
-                }),
+                .new_framed(io),
             maximum,
             last_received_bytes: None,
-            last_send_bytes: None,
         }
     }
 
@@ -43,31 +34,13 @@ where
         self.last_received_bytes
     }
 
-    /// Intended JSON payload size for the latest send attempt, even if sending failed.
-    /// None if serialization failed or no send was attempted.
-    pub fn last_send_bytes(&self) -> Option<usize> {
-        self.last_send_bytes
-    }
-
-    /// Bytes accepted by the underlying writer during the latest send attempt,
-    /// including the four-byte frame prefix. This does not imply peer receipt and
-    /// excludes transport overhead and retransmissions.
-    pub fn last_send_written_bytes(&self) -> usize {
-        self.inner.get_ref().written
-    }
-
     /// Serializes and sends a typed message, returning its encoded size.
-    /// Discard the connection after a failed or cancelled send; a partial frame
-    /// may remain buffered.
     pub async fn send<T: Serialize>(
         &mut self,
         message: &T,
     ) -> Result<usize, ProverConnectionError> {
-        self.last_send_bytes = None;
-        self.inner.get_mut().written = 0;
         let payload = serde_json::to_vec(message).map_err(ProverConnectionError::Json)?;
         let bytes = payload.len();
-        self.last_send_bytes = Some(bytes);
         self.inner
             .send(payload.into())
             .await
@@ -88,43 +61,6 @@ where
         serde_json::from_slice(&payload)
             .map(Some)
             .map_err(ProverConnectionError::Json)
-    }
-}
-
-struct WriteCounted<T> {
-    inner: T,
-    written: usize,
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for WriteCounted<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for WriteCounted<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(bytes)) = &result {
-            self.written += bytes;
-        }
-        result
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -194,118 +130,6 @@ mod tests {
 
     use super::*;
     use crate::VerifyRequest;
-
-    /// A writer that accepts short writes before failing at a deterministic offset.
-    #[derive(Default)]
-    struct FailingWriter {
-        bytes: Vec<u8>,
-        limit: usize,
-        fail_flush: bool,
-    }
-
-    impl AsyncRead for FailingWriter {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl AsyncWrite for FailingWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            let count = buf.len().min(2).min(self.limit - self.bytes.len());
-            if count == 0 {
-                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-            }
-            self.bytes.extend_from_slice(&buf[..count]);
-            Poll::Ready(Ok(count))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(if self.fail_flush {
-                Err(io::ErrorKind::BrokenPipe.into())
-            } else {
-                Ok(())
-            })
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn send_sizes_survive_partial_write_and_flush_failures() {
-        let message = "payload";
-        let payload = serde_json::to_vec(message).unwrap();
-        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
-        frame.extend_from_slice(&payload);
-
-        // No bytes, partial prefix, partial payload, and complete frame + failed flush.
-        for limit in [0, 2, 7, frame.len()] {
-            let mut connection = ProverConnection::new(
-                FailingWriter {
-                    limit,
-                    fail_flush: true,
-                    ..Default::default()
-                },
-                1024,
-            );
-            let error = connection.send(&message).await.unwrap_err();
-            assert!(matches!(error, ProverConnectionError::Io(_)));
-            assert_eq!(connection.last_send_bytes(), Some(payload.len()));
-            assert_eq!(connection.last_send_written_bytes(), limit);
-            assert_eq!(connection.inner.get_ref().inner.bytes, frame[..limit]);
-        }
-    }
-
-    #[tokio::test]
-    async fn send_sizes_reset_between_attempts() {
-        let (writer, _reader) = tokio::io::duplex(1024);
-        let mut connection = ProverConnection::new(writer, 16);
-        assert_eq!(connection.last_send_bytes(), None);
-        assert_eq!(connection.last_send_written_bytes(), 0);
-        for message in ["first", "second"] {
-            let bytes = connection.send(&message).await.unwrap();
-            assert_eq!(connection.last_send_bytes(), Some(bytes));
-            assert_eq!(connection.last_send_written_bytes(), bytes + 4);
-        }
-
-        let oversized = "x".repeat(32);
-        assert!(matches!(
-            connection.send(&oversized).await,
-            Err(ProverConnectionError::MessageTooLarge { .. })
-        ));
-        assert_eq!(connection.last_send_bytes(), Some(34));
-        assert_eq!(connection.last_send_written_bytes(), 0);
-    }
-
-    #[tokio::test]
-    async fn serialization_failure_has_no_intended_or_written_bytes() {
-        struct InvalidMessage;
-        impl Serialize for InvalidMessage {
-            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
-                Err(serde::ser::Error::custom(
-                    "intentional serialization failure",
-                ))
-            }
-        }
-        let (writer, _reader) = tokio::io::duplex(1024);
-        let mut connection = ProverConnection::new(writer, 1024);
-        connection.send(&"previous").await.unwrap();
-        assert!(matches!(
-            connection.send(&InvalidMessage).await,
-            Err(ProverConnectionError::Json(_))
-        ));
-        assert_eq!(connection.last_send_bytes(), None);
-        assert_eq!(connection.last_send_written_bytes(), 0);
-    }
 
     #[tokio::test]
     async fn request_round_trip() {
