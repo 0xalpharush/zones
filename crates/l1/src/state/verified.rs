@@ -430,9 +430,6 @@ pub(crate) fn verify_multi_proof(
             .ok_or_else(|| eyre::eyre!("unexpected account proof for {address}"))?;
         let proof = AccountProof::from_eip1186_proof(response);
         ensure!(proof.address == address, "account proof address changed");
-        proof
-            .verify(state_root)
-            .map_err(|error| eyre::eyre!("invalid proof for account {address}: {error}"))?;
 
         let mut slots = BTreeMap::new();
         for storage_proof in &proof.storage_proofs {
@@ -452,6 +449,10 @@ pub(crate) fn verify_multi_proof(
             slots.len() == requested.len(),
             "storage proof targets for account {address} were incomplete"
         );
+
+        proof
+            .verify(state_root)
+            .map_err(|error| eyre::eyre!("invalid proof for account {address}: {error}"))?;
         authenticated.insert(
             address,
             VerifiedAccountState {
@@ -579,7 +580,7 @@ mod tests {
         Header,
         constants::{EMPTY_ROOT_HASH, KECCAK_EMPTY},
     };
-    use alloy_primitives::U256;
+    use alloy_primitives::{Bytes, U256};
     use alloy_provider::{Provider as _, ProviderBuilder};
     use alloy_rpc_types_eth::EIP1186StorageProof;
     use alloy_transport::mock::Asserter;
@@ -848,6 +849,20 @@ mod tests {
                 vec![empty_account_response(account, [B256::with_last_byte(2)])],
             )
             .is_err()
+        );
+
+        let unexpected_slot = B256::with_last_byte(2);
+        let mut malformed = empty_account_response(account, [unexpected_slot]);
+        malformed.storage_proof[0].proof = vec![Bytes::from_static(&[0xff])];
+        let error = verify_multi_proof(
+            EMPTY_ROOT_HASH,
+            &BTreeMap::from([(account, BTreeSet::new())]),
+            vec![malformed],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected storage proof"),
+            "{error:#}"
         );
     }
 }
