@@ -2,6 +2,9 @@ use super::*;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, btree_map::Entry};
 
+/// Avoid blocking and Rayon scheduling overhead for small deposit batches.
+const MIN_PARALLEL_DEPOSITS: usize = 10;
+
 /// An L1 block's header paired with the deposits found in that block.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct L1BlockDeposits {
@@ -39,7 +42,7 @@ impl L1BlockDeposits {
             }
         }
 
-        let prepared = if keys.is_empty() {
+        let prepared = if encrypted_deposits < MIN_PARALLEL_DEPOSITS {
             deposits
                 .iter()
                 .map(|deposit| prepare_deposit(deposit, &keys, portal_address, l1_block_number))
