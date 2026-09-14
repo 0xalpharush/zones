@@ -1,10 +1,9 @@
 //! Builder-local `advanceTempo` cache prewarming.
 //!
-//! Workers execute one-deposit `advanceTempo` calls against independent throwaway Zone builders.
-//! Their state and execution output are discarded; the intended shared effect is warming exact-L1
-//! cache entries through the normal Zone EVM path.
+//! Each queued deposit is executed in an independent throwaway Zone builder. Execution output is
+//! discarded; only exact-L1 reads populate the cache shared with canonical execution.
 
-use crate::build_advance_tempo_tx;
+use crate::builder::build_advance_tempo_tx_owned;
 use alloy_evm::block::BlockExecutor;
 use alloy_primitives::B256;
 use reth_errors::ProviderError;
@@ -13,10 +12,7 @@ use reth_primitives_traits::SealedHeader;
 use reth_revm::{State, cancelled::ManualCancel, database::StateProviderDatabase};
 use reth_storage_api::StateProviderFactory;
 use reth_tasks::TaskExecutor;
-use std::{
-    error::Error,
-    sync::{Arc, mpsc},
-};
+use std::{error::Error, sync::Arc};
 use tempo_evm::TempoNextBlockEnvAttributes;
 use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::DepositType;
@@ -27,12 +23,9 @@ use zone_l1::PreparedL1Block;
 pub(crate) struct PrewarmingExecutionContext<Provider> {
     pub(crate) provider: Provider,
     pub(crate) evm_config: ZoneEvmConfig,
-    pub(crate) task_executor: TaskExecutor,
-    pub(crate) l1_fetch_concurrency: usize,
     pub(crate) parent_hash: B256,
     pub(crate) parent_header: SealedHeader<TempoHeader>,
     pub(crate) next_block_env_attributes: TempoNextBlockEnvAttributes,
-    pub(crate) prepared: PreparedL1Block,
     pub(crate) chain_id: u64,
 }
 
@@ -40,71 +33,49 @@ impl<Provider> PrewarmingExecutionContext<Provider>
 where
     Provider: StateProviderFactory + Clone + 'static,
 {
-    /// Start a bounded coordinator that dispatches deposits in canonical queue order.
-    ///
-    /// Returns immediately; the handle stops further dispatch when dropped without waiting for
-    /// already-running workers.
-    pub(crate) fn start(self) -> AdvanceTempoPrewarming {
-        let prewarming = AdvanceTempoPrewarming::default();
-        let num_deposits = self.prepared.queued_deposits.len();
-        let pool = self.task_executor.prewarming_pool();
-        let limit = self
-            .l1_fetch_concurrency
-            .saturating_sub(1)
-            .min(pool.current_num_threads())
-            .min(num_deposits);
-        if limit == 0 {
-            return prewarming;
+    /// Enqueue one disposable simulation per deposit directly on the prewarming pool.
+    pub(crate) fn start(
+        self,
+        task_executor: &TaskExecutor,
+        prepared: &PreparedL1Block,
+    ) -> AdvanceTempoPrewarming {
+        let handle = AdvanceTempoPrewarming::default();
+        if prepared.queued_deposits.is_empty() {
+            return handle;
         }
 
         let context = Arc::new(self);
-        let cancel = prewarming.cancel_worker();
-        let task_executor = context.task_executor.clone();
-        task_executor.spawn_blocking_named("zone-advance-tempo-prewarm", move || {
-            Self::coordinate(context, limit, cancel);
-        });
-        prewarming
-    }
+        let pool = task_executor.prewarming_pool();
+        let mut decryptions = prepared.decryptions.iter();
 
-    /// Dispatches deposits in queue order while keeping at most `limit` jobs active.
-    fn coordinate(context: Arc<Self>, limit: usize, cancel: ManualCancel) {
-        let pool = context.task_executor.prewarming_pool();
-        let (tx, rx) = mpsc::channel();
-        let mut decryptions = context.prepared.decryptions.iter();
-
-        for (index, deposit) in context.prepared.queued_deposits.iter().enumerate() {
-            // Wait only after filling the bounded window.
-            if cancel.is_cancelled() || (index >= limit && rx.recv().is_err()) {
-                break;
-            }
-
-            // FIFO dispatch lets the cursor get the entry without scanning the queued-deposit prefix.
+        // The pool bounds concurrency; cancelled queued jobs skip EVM initialization.
+        for deposit in &prepared.queued_deposits {
             let decryptions = (deposit.depositType == DepositType::Deposit)
                 .then(|| decryptions.next().cloned())
                 .flatten()
                 .into_iter()
                 .collect();
             let partial = PreparedL1Block {
-                header: context.prepared.header.clone(),
-                enabled_tokens: context.prepared.enabled_tokens.clone(),
+                header: prepared.header.clone(),
+                enabled_tokens: prepared.enabled_tokens.clone(),
                 queued_deposits: vec![deposit.clone()],
                 decryptions,
             };
-            let (ctx, cancel, tx) = (context.clone(), cancel.clone(), tx.clone());
-
+            let context = context.clone();
+            let cancel = handle.cancel.clone();
             pool.spawn(move || {
-                // Do not initialize a worker after canonical `advanceTempo` has completed.
                 if !cancel.is_cancelled() {
-                    let _ = ctx.prewarm_deposit(&partial);
+                    let _ = context.prewarm_deposit(partial);
                 }
-                let _ = tx.send(());
             });
         }
+
+        handle
     }
 
     fn prewarm_deposit(
         &self,
-        partial: &PreparedL1Block,
+        partial: PreparedL1Block,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let state =
             StateProviderDatabase::new(self.provider.state_by_block_hash(self.parent_hash)?);
@@ -120,27 +91,21 @@ where
         )?;
         worker.apply_pre_execution_changes()?;
 
-        // Partial queues normally revert at final queue-hash validation. Reads performed before
-        // that check have already warmed the shared cache, and the throwaway state is discarded.
+        // Queue-hash validation may fail, but preceding reads have already warmed the shared cache.
         _ = worker
             .executor_mut()
-            .execute_transaction_without_commit(build_advance_tempo_tx(partial, self.chain_id));
+            .execute_transaction_without_commit(build_advance_tempo_tx_owned(
+                partial,
+                self.chain_id,
+            ));
         Ok(())
     }
 }
 
-/// Stops further dispatch when canonical `advanceTempo` completes.
-///
-/// Dropping this handle does not wait for already-running workers.
+/// Cancels queued work that has not started when dropped.
 #[derive(Debug, Default)]
 pub(crate) struct AdvanceTempoPrewarming {
     cancel: ManualCancel,
-}
-
-impl AdvanceTempoPrewarming {
-    fn cancel_worker(&self) -> ManualCancel {
-        self.cancel.clone()
-    }
 }
 
 impl Drop for AdvanceTempoPrewarming {
