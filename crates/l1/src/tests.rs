@@ -2459,10 +2459,10 @@ async fn observer_delivery_resumes_after_reconnect_without_duplicates() {
             // Governance is outside the consumer's cache window when it observes this block.
             subscriber.block_tracker.initialize_consumed_through(0);
         }
-        let logs = (0..6)
+        let logs: Vec<_> = (0..6)
             .map(|index| submission_log(subscriber.config.portal_address, index))
             .collect();
-        let expected_logs = logs.iter().map(|log| log.inner.clone()).collect();
+        let expected_logs: Vec<_> = logs.iter().map(|log| log.inner.clone()).collect();
         let (header, receipts) = block_with_logs(checkpoint, logs);
         let anchor = seal(header.clone()).num_hash();
         let rpc = Asserter::new();

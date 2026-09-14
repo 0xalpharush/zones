@@ -191,13 +191,8 @@ async fn watch_portal_pause(
             let header = finalized_header(&l1_provider).await?;
             let block = alloy_eips::NumHash::new(header.number(), header.hash);
             if last_checked != Some(block) {
-                refresh_portal_pause_at(
-                    &l1_provider,
-                    portal_address,
-                    &l1_block_tracker,
-                    &header,
-                )
-                .await?;
+                refresh_portal_pause_at(&l1_provider, portal_address, &l1_block_tracker, &header)
+                    .await?;
                 if l1_block_tracker.portal_pause_snapshot() == Some(block) {
                     last_checked = Some(block);
                 }
@@ -2239,7 +2234,11 @@ mod tests {
         portal: Address,
         tracker: &L1BlockTracker,
     ) {
-        assert!(refresh_portal_pause(provider, portal, tracker).await.is_err());
+        assert!(
+            refresh_portal_pause(provider, portal, tracker)
+                .await
+                .is_err()
+        );
         assert!(tracker.portal_paused());
     }
 
