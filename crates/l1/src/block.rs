@@ -24,9 +24,8 @@ impl L1BlockDeposits {
         portal_address: Address,
     ) -> eyre::Result<PreparedL1Block> {
         let start = std::time::Instant::now();
-        let Self { header, events } = self;
-        let l1_block_number = header.inner.number;
-        let (total_deposits, deposits) = (events.deposits.len(), events.deposits);
+        let l1_block_number = self.header.inner.number;
+        let (total_deposits, deposits) = (self.events.deposits.len(), self.events.deposits);
 
         // Resolve keys in deposit order before parallel work so missing-key errors remain stable.
         let mut keys: BTreeMap<U256, k256::SecretKey> = BTreeMap::new();
@@ -62,7 +61,12 @@ impl L1BlockDeposits {
             decryptions.extend(decryption);
         }
 
-        let enabled_tokens: Vec<_> = events.enabled_tokens.iter().map(|t| t.to_abi()).collect();
+        let enabled_tokens: Vec<_> = self
+            .events
+            .enabled_tokens
+            .iter()
+            .map(|t| t.to_abi())
+            .collect();
 
         let elapsed = start.elapsed();
         info!(
@@ -76,7 +80,7 @@ impl L1BlockDeposits {
         );
 
         Ok(PreparedL1Block {
-            header,
+            header: self.header,
             queued_deposits,
             decryptions,
             enabled_tokens,

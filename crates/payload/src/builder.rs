@@ -238,8 +238,7 @@ where
             PayloadBuilderError::Internal(err.into())
         })?;
 
-        // Race one-deposit throwaway executions against canonical advanceTempo. The prewarming pool
-        // bounds active work; no separate L1-concurrency window is needed.
+        // Prewarm L1 reads in parallel with canonical `advanceTempo` (the pool bounds concurrency).
         let prewarming = PrewarmingExecutionContext {
             provider: self.provider.clone(),
             evm_config: self.evm_config.clone(),
@@ -264,7 +263,6 @@ where
                 );
                 err
             })?;
-        // Canonical `advanceTempo` can no longer benefit from additional reads.
         drop(prewarming);
 
         // Execute pool transactions until either all of them fit or their packed RLP bytes reach
