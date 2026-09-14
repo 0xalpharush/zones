@@ -17,9 +17,6 @@ use tokio::sync::{Notify, watch};
 const MAX_SETTLEMENT_HEIGHTS: usize = 128;
 const MAX_SETTLEMENT_DIGESTS_PER_HEIGHT: usize = 8;
 
-type SettlementSignatures =
-    BTreeMap<u64, BTreeMap<B256, BTreeMap<Address, SignedSettlementAttestation>>>;
-
 sol! {
     /// Exact settlement statement verified by ZonePortal.
     #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +41,15 @@ sol! {
         SettlementAttestation attestation;
         bytes signature;
     }
+}
+
+type SettlementCandidates = BTreeMap<u64, BTreeMap<B256, SettlementCandidate>>;
+
+/// One digest's statement, shared by all of its distinct signer signatures.
+#[derive(Debug)]
+struct SettlementCandidate {
+    attest: SettlementAttestation,
+    sigs: BTreeMap<Address, Bytes>,
 }
 
 /// Immutable values that domain-separate one zone's attestations.
@@ -123,7 +129,7 @@ pub struct SettlementCertificate {
 /// Settlement certificates shared by P2P and batch submission.
 #[derive(Debug, Clone)]
 pub struct AttestationStore {
-    settlements: Arc<RwLock<SettlementSignatures>>,
+    settlements: Arc<RwLock<SettlementCandidates>>,
     settlement_changed: Arc<Notify>,
     submitted_height: watch::Sender<u64>,
 }
@@ -179,29 +185,21 @@ impl AttestationStore {
             {
                 let (&oldest_digest, oldest) = by_digest
                     .iter()
-                    .min_by_key(|(_, signatures)| {
-                        signatures
-                            .values()
-                            .next()
-                            .expect("nonempty signatures")
-                            .attestation
-                            .anchorBlockNumber
-                    })
+                    .min_by_key(|(_, candidate)| candidate.attest.anchorBlockNumber)
                     .expect("nonempty candidates");
-                let oldest_anchor = oldest
-                    .values()
-                    .next()
-                    .expect("nonempty signatures")
-                    .attestation
-                    .anchorBlockNumber;
-                if signed.attestation.anchorBlockNumber < oldest_anchor {
+                if signed.attestation.anchorBlockNumber < oldest.attest.anchorBlockNumber {
                     return (false, 0);
                 }
                 by_digest.remove(&oldest_digest);
             }
-            let signatures = by_digest.entry(digest).or_default();
-            let inserted = signatures.insert(signer, signed).is_none();
-            (inserted, signatures.len())
+            let candidate = by_digest
+                .entry(digest)
+                .or_insert_with(|| SettlementCandidate {
+                    attest: signed.attestation,
+                    sigs: BTreeMap::new(),
+                });
+            let inserted = candidate.sigs.insert(signer, signed.signature).is_none();
+            (inserted, candidate.sigs.len())
         };
 
         // There is one in-order batch submission waiter; notify_one retains a permit if insertion
@@ -226,6 +224,7 @@ impl AttestationStore {
         let signatures = all
             .get(&height)
             .and_then(|by_digest| by_digest.get(&digest))
+            .map(|candidate| &candidate.sigs)
             .filter(|signatures| signatures.contains_key(&leader))
             .ok_or_else(|| eyre::eyre!("settlement response has no active leader proposal"))?;
         eyre::ensure!(
@@ -258,13 +257,14 @@ impl AttestationStore {
             let signatures = all
                 .get_mut(&height)
                 .and_then(|by_digest| by_digest.get_mut(&digest))
+                .map(|candidate| &mut candidate.sigs)
                 .filter(|signatures| signatures.contains_key(&leader))
                 .ok_or_else(|| eyre::eyre!("settlement response has no active leader proposal"))?;
             eyre::ensure!(
                 !signatures.contains_key(&follower),
                 "settlement response signer is already stored"
             );
-            signatures.insert(follower, signed);
+            signatures.insert(follower, signed.signature);
             signatures.len()
         };
 
@@ -301,21 +301,17 @@ impl AttestationStore {
             .settlements
             .read()
             .expect("attestation store lock poisoned");
-        let (digest, signatures) = all
+        let (digest, candidate) = all
             .get(&height)?
             .iter()
-            .find(|(_, signatures)| signatures.len() >= quorum)?;
-        let attestation = signatures.values().next()?.attestation.clone();
+            .find(|(_, candidate)| candidate.sigs.len() >= quorum)?;
 
         Some(SettlementCertificate {
             height,
             digest: *digest,
-            attestation,
+            attestation: candidate.attest.clone(),
             // Signer-address ordering makes transaction calldata deterministic.
-            signatures: signatures
-                .values()
-                .map(|signed| signed.signature.clone())
-                .collect(),
+            signatures: candidate.sigs.values().cloned().collect(),
         })
     }
 
@@ -326,8 +322,7 @@ impl AttestationStore {
             .expect("attestation store lock poisoned")
             .get(&height)?
             .values()
-            .filter_map(|signatures| signatures.values().next())
-            .map(|signed| signed.attestation.anchorBlockNumber)
+            .map(|candidate| candidate.attest.anchorBlockNumber)
             .max()
     }
 
@@ -497,16 +492,36 @@ mod tests {
                 )
                 .is_err()
         );
+        let digest = domain().settlement_digest(&statement(10, 199));
+        store
+            .precheck_follower_settlement(10, digest, leader.address(), follower.address())
+            .unwrap();
+        let response = sign(10, 199, &follower);
         assert_eq!(
             store
                 .insert_follower_settlement(
                     domain(),
                     leader.address(),
                     follower.address(),
-                    sign(10, 199, &follower)
+                    response.clone(),
                 )
                 .unwrap(),
             2
+        );
+        assert!(
+            store
+                .precheck_follower_settlement(10, digest, leader.address(), follower.address())
+                .is_err()
+        );
+        assert!(
+            store
+                .insert_follower_settlement(
+                    domain(),
+                    leader.address(),
+                    follower.address(),
+                    response
+                )
+                .is_err()
         );
         assert!(store.settlement_at(10, 2).is_some());
         for height in 11..300 {
@@ -593,10 +608,15 @@ mod tests {
             withdrawalQueueHash: B256::repeat_byte(6),
             verifierConfigHash: B256::repeat_byte(7),
         };
-        store.insert_settlement(
-            domain(),
-            signer_a.address(),
-            SignedSettlementAttestation::sign(attestation.clone(), domain(), &signer_a).unwrap(),
+        let signed_a =
+            SignedSettlementAttestation::sign(attestation.clone(), domain(), &signer_a).unwrap();
+        assert_eq!(
+            store.insert_settlement(domain(), signer_a.address(), signed_a.clone()),
+            (true, 1)
+        );
+        assert_eq!(
+            store.insert_settlement(domain(), signer_a.address(), signed_a),
+            (false, 1)
         );
 
         let waiting = {
@@ -613,10 +633,27 @@ mod tests {
         store.insert_settlement(
             domain(),
             signer_b.address(),
-            SignedSettlementAttestation::sign(attestation, domain(), &signer_b).unwrap(),
+            SignedSettlementAttestation::sign(attestation.clone(), domain(), &signer_b).unwrap(),
         );
         let certificate = waiting.await.unwrap().unwrap();
-        assert_eq!(certificate.signatures.len(), 2);
+        assert_eq!(certificate.attestation, attestation);
+        assert_eq!(certificate.digest, domain().settlement_digest(&attestation));
+        assert_eq!(store.latest_settlement_anchor(10), Some(100));
+        let recovered: Vec<_> = certificate
+            .signatures
+            .into_iter()
+            .map(|signature| {
+                SignedSettlementAttestation {
+                    attestation: attestation.clone(),
+                    signature,
+                }
+                .recover_signer(domain())
+                .unwrap()
+            })
+            .collect();
+        let mut expected = [signer_a.address(), signer_b.address()];
+        expected.sort();
+        assert_eq!(recovered, expected);
 
         store.remove_submitted(10);
         assert!(store.settlement_at(10, 1).is_none());

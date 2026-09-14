@@ -44,30 +44,6 @@ pub(crate) struct AttestationContext {
     pub(crate) l1_block_tracker: zone_l1::L1BlockTracker,
 }
 
-impl AttestationContext {
-    pub(crate) fn new(
-        domain: AttestationDomain,
-        pinned_sequencer_set_version: Option<u64>,
-        signer: Option<PrivateKeySigner>,
-        addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-        store: AttestationStore,
-        l1_provider: DynProvider<TempoNetwork>,
-        anchor_config: BatchAnchorConfig,
-        l1_block_tracker: zone_l1::L1BlockTracker,
-    ) -> Self {
-        Self {
-            domain,
-            pinned_sequencer_set_version,
-            signer,
-            addresses,
-            store,
-            l1_provider,
-            anchor_config,
-            l1_block_tracker,
-        }
-    }
-}
-
 /// Fallback cadence for transient L1 validation failures or dropped P2P settlement proposals.
 const SETTLEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -702,20 +678,20 @@ mod tests {
             .observe_portal_pause(alloy_eips::NumHash::new(10, B256::repeat_byte(1)), true)
             .unwrap();
         let store = AttestationStore::default();
-        let context = AttestationContext::new(
-            AttestationDomain {
+        let context = AttestationContext {
+            domain: AttestationDomain {
                 l1_chain_id: 1337,
                 portal_address: alloy_primitives::Address::repeat_byte(1),
                 zone_id: 7,
             },
-            None,
-            Some(PrivateKeySigner::random()),
-            HashMap::new(),
-            store.clone(),
+            pinned_sequencer_set_version: None,
+            signer: Some(PrivateKeySigner::random()),
+            addresses: HashMap::new(),
+            store: store.clone(),
             l1_provider,
-            BatchAnchorConfig::default(),
-            tracker,
-        );
+            anchor_config: BatchAnchorConfig::default(),
+            l1_block_tracker: tracker,
+        };
         let (commands, mut receiver) = mpsc::channel(1);
         for _ in 0..10 {
             let error = propose_settlement(&provider, 10, &commands, &context)
@@ -747,18 +723,18 @@ mod tests {
             portal_address: alloy_primitives::Address::repeat_byte(1),
             zone_id: 7,
         };
-        let context = AttestationContext::new(
+        let context = AttestationContext {
             domain,
-            None,
-            Some(leader.clone()),
-            HashMap::new(),
-            AttestationStore::default(),
-            ProviderBuilder::new_with_network::<TempoNetwork>()
+            pinned_sequencer_set_version: None,
+            signer: Some(leader.clone()),
+            addresses: HashMap::new(),
+            store: AttestationStore::default(),
+            l1_provider: ProviderBuilder::new_with_network::<TempoNetwork>()
                 .connect_mocked_client(Asserter::new())
                 .erased(),
-            BatchAnchorConfig::new(100, 10).unwrap(),
-            zone_l1::L1BlockTracker::default(),
-        );
+            anchor_config: BatchAnchorConfig::new(100, 10).unwrap(),
+            l1_block_tracker: zone_l1::L1BlockTracker::default(),
+        };
         let statement = |anchor| SettlementAttestation {
             zoneId: 7,
             sequencerSetVersion: 3,

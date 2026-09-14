@@ -4,11 +4,9 @@ use crate::{
     state::EnabledTokenRegistry,
 };
 use eyre::{OptionExt as _, WrapErr as _};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
 use tempo_primitives::is_tip20_prefix;
-
-use std::collections::BTreeMap;
 
 /// Maximum number of authenticated L1 blocks the subscriber may retain ahead of the Zone
 /// consumer's imported Tempo checkpoint (approximately one hour at Tempo's 500ms block time).
@@ -25,7 +23,7 @@ struct L1BlockTrackerState {
     pruned_through: Option<u64>,
     portal_pause: Option<(NumHash, bool)>,
     control_plane: Option<NumHash>,
-    pending: BTreeMap<u64, (SealedHeader<TempoHeader>, L1ProcessedEvents)>,
+    pending: BTreeMap<u64, PendingExecutionBlock>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,12 +100,9 @@ const RECENT_PORTAL_EVIDENCE_BLOCKS: u64 = 256;
 /// whose derived state has been applied to the local caches.
 ///
 /// Followers use this to gate zone-block import on the exact L1 anchor embedded in
-/// `advanceTempo`. The tracker also provides backpressure for the L1 subscriber: before fetching
-/// a block, the subscriber waits for capacity relative to the last checkpoint released by the
-/// Zone consumer. Queue-backed subscribers therefore retain observations until block production
-/// or follower import calls [`L1BlockTracker::prune_through`].
-///
-/// This tracker deliberately assumes observed L1 blocks do not reorg: conflicting or
+/// `advanceTempo`. Governance observation advances independently of execution capacity, while the
+/// bounded execution history remains retained until block production or follower import calls
+/// [`L1BlockTracker::prune_through`]. Finalized L1 blocks are assumed not to reorg; conflicting or
 /// non-contiguous observations are errors.
 #[derive(Debug, Clone)]
 pub struct L1BlockTracker {
@@ -232,6 +227,11 @@ impl L1BlockTracker {
     /// Subscribe to validated L1-state changes, including portal pause transitions.
     pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<()> {
         self.changed.subscribe()
+    }
+
+    /// Return the finalized block of the latest portal pause snapshot, if one is known.
+    pub fn portal_pause_snapshot(&self) -> Option<NumHash> {
+        self.state.read().portal_pause.map(|(block, _)| block)
     }
 
     /// Return whether `number` fits inside the bounded subscriber lookahead window.
@@ -448,6 +448,53 @@ impl L1BlockTracker {
         Ok(())
     }
 
+    fn publish_control_plane_block(
+        &self,
+        range_start: u64,
+        header: SealedHeader<TempoHeader>,
+        events: L1ProcessedEvents,
+    ) {
+        let block_number = header.number();
+        let anchor = header.num_hash();
+        let mut state = self.state.write();
+        let consumed = *state
+            .pruned_through
+            .get_or_insert(range_start.saturating_sub(1));
+        if block_number <= consumed.saturating_add(MAX_L1_LOOKAHEAD_BLOCKS) {
+            state
+                .pending
+                .insert(block_number, PendingExecutionBlock::new(header, events));
+        }
+        state.control_plane = Some(anchor);
+        drop(state);
+        self.changed.send_replace(());
+    }
+
+    fn pending_execution_block(&self, number: u64) -> Option<PendingExecutionBlock> {
+        self.state.read().pending.get(&number).cloned()
+    }
+
+    fn retain_pending_execution_block(&self, pending: PendingExecutionBlock) {
+        self.state
+            .write()
+            .pending
+            .insert(pending.block.header.number(), pending);
+    }
+
+    fn acknowledge_finalized_batch(&self, number: u64) {
+        self.state
+            .write()
+            .pending
+            .get_mut(&number)
+            .expect("in-flight block retained")
+            .finalized_batches
+            .pop_front();
+    }
+
+    fn remove_pending_execution_block(&self, number: u64) {
+        self.state.write().pending.remove(&number);
+    }
+
     /// Drop observations through `number` after the corresponding Zone checkpoint is canonical.
     ///
     /// Advancing this watermark releases L1 subscriber capacity, so queue consumers must call it
@@ -480,6 +527,32 @@ impl L1BlockTracker {
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
+struct PendingExecutionBlock {
+    block: L1BlockDeposits,
+    portal_evidence: Option<AuthenticatedPortalLogs>,
+    finalized_batches: VecDeque<FinalizedBatchSubmission>,
+}
+
+impl PendingExecutionBlock {
+    /// Retain only execution inputs; governance was already applied by the live observer.
+    fn new(header: SealedHeader<TempoHeader>, events: L1ProcessedEvents) -> Self {
+        let portal_evidence = events.portal_logs.map(|logs| AuthenticatedPortalLogs {
+            block: header.num_hash(),
+            parent_hash: header.parent_hash(),
+            logs,
+        });
+        Self {
+            block: L1BlockDeposits {
+                header,
+                events: events.portal_events,
+            },
+            portal_evidence,
+            finalized_batches: events.finalized_batches,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct L1ProcessedEvents {
     pub(crate) portal_events: L1PortalEvents,
     pub(crate) invalidated: HashSet<Address>,
@@ -527,7 +600,7 @@ pub struct L1SubscriberConfig {
     pub retain_portal_evidence: bool,
 }
 
-/// L1 chain subscriber that listens for new blocks and extracts deposit events.
+/// Follows finalized L1 governance and feeds bounded execution work to Zone consumers.
 pub struct L1Subscriber<P> {
     pub(crate) config: L1SubscriberConfig,
     pub(crate) zone_provider: P,
@@ -671,20 +744,23 @@ where
         }
     }
 
-    /// Determine the starting block number for backfill.
-    ///
-    /// The zone's persisted Tempo checkpoint is the authoritative source for
-    /// where ingestion resumes. A non-zero hash distinguishes an L1-anchored
-    /// block-zero genesis from the unanchored template.
-    pub(crate) fn resolve_start_block(&self) -> Result<u64, L1SubscriberError> {
+    fn local_checkpoint(&self) -> Result<NumHash, L1SubscriberError> {
         let state = self.zone_provider.latest().map_err(eyre::Report::from)?;
-        let local_checkpoint = state.tempo_num_hash().map_err(eyre::Report::from)?;
-        if local_checkpoint.hash == B256::ZERO {
+        let checkpoint = state.tempo_num_hash().map_err(eyre::Report::from)?;
+        if checkpoint.hash == B256::ZERO {
             return Err(eyre::eyre!("zone genesis is not anchored to an L1 block").into());
         }
-        let local_tempo_block_number = local_checkpoint.number;
-        info!(local_tempo_block_number, "Resuming from local zone state");
-        Ok(local_tempo_block_number + 1)
+        Ok(checkpoint)
+    }
+
+    /// Return the first L1 block not represented by the latest local Zone state.
+    pub(crate) fn resolve_start_block(&self) -> Result<u64, L1SubscriberError> {
+        let checkpoint = self.local_checkpoint()?;
+        info!(
+            local_tempo_block_number = checkpoint.number,
+            "Resuming from local zone state"
+        );
+        Ok(checkpoint.number + 1)
     }
 
     /// Resolve the first L1 block that has not already been ingested.
@@ -767,15 +843,7 @@ where
         l1_provider: &impl Provider<TempoNetwork>,
         mut stream: HeaderStream,
     ) -> Result<(), L1SubscriberError> {
-        let checkpoint = self
-            .zone_provider
-            .latest()
-            .map_err(eyre::Report::from)?
-            .tempo_num_hash()
-            .map_err(eyre::Report::from)?;
-        if checkpoint.hash == B256::ZERO {
-            return Err(eyre::eyre!("zone genesis is not anchored to an L1 block").into());
-        }
+        let checkpoint = self.local_checkpoint()?;
         let mut next_block = self
             .block_tracker
             .state
@@ -920,19 +988,9 @@ where
             self.apply_enabled_token_events(events);
             self.update_l1_state_anchor(block_number, &processed_events.invalidated);
             self.record_portal_event_metrics(events);
-            // Wake the queue reader only after all governance state is applied.
-            {
-                let mut state = self.block_tracker.state.write();
-                // Preserve the execution window without making governance wait for its consumer.
-                let consumed = *state.pruned_through.get_or_insert(from.saturating_sub(1));
-                if block_number <= consumed.saturating_add(MAX_L1_LOOKAHEAD_BLOCKS) {
-                    state
-                        .pending
-                        .insert(block_number, (sealed, processed_events));
-                }
-                state.control_plane = Some(anchor);
-            }
-            self.block_tracker.changed.send_replace(());
+            // Publish execution work only after all governance state is applied.
+            self.block_tracker
+                .publish_control_plane_block(from, sealed, processed_events);
             processed += 1;
 
             if processed.is_multiple_of(100) {
@@ -1011,15 +1069,12 @@ where
                     .map_err(|_| eyre::eyre!("L1 block tracker closed"))?;
             }
             self.block_tracker.wait_for_capacity(number).await?;
-            // Take a clone until delivery completes, so reconnects cannot lose observer events.
-            let cached = self
-                .block_tracker
-                .state
-                .read()
-                .pending
-                .get(&number)
-                .cloned();
-            let (header, events) = if let Some(cached) = cached {
+            // Keep cached work until delivery completes so reconnects cannot lose observer events.
+            let PendingExecutionBlock {
+                block: L1BlockDeposits { header, events },
+                portal_evidence,
+                finalized_batches,
+            } = if let Some(cached) = self.block_tracker.pending_execution_block(number) {
                 replay.pop_front();
                 cached
             } else {
@@ -1035,17 +1090,14 @@ where
                     .ok_or_eyre("missing authenticated replay header")?;
                 let events = self.fetch_events(provider, &header).await?;
                 // Keep the in-flight replay block too: reconnects must retain observer progress.
+                let pending_block = PendingExecutionBlock::new(header, events);
                 self.block_tracker
-                    .state
-                    .write()
-                    .pending
-                    .insert(number, (header.clone(), events.clone()));
-                (header, events)
+                    .retain_pending_execution_block(pending_block.clone());
+                pending_block
             };
             let anchor = header.num_hash();
-            let parent_hash = header.parent_hash();
             if let Some(sender) = &self.finalized_batch_submissions {
-                for submission in events.finalized_batches {
+                for submission in finalized_batches {
                     sender
                         .send(submission)
                         .await
@@ -1056,40 +1108,22 @@ where
                                 "finalized batch submission observer is unavailable"
                             ),
                         })?;
-                    // No await between delivery and removal: cancellation can only leave the
-                    // undelivered suffix for the next connection.
-                    self.block_tracker
-                        .state
-                        .write()
-                        .pending
-                        .get_mut(&number)
-                        .expect("in-flight block retained")
-                        .1
-                        .finalized_batches
-                        .pop_front();
+                    // Acknowledge immediately so cancellation leaves only the undelivered suffix.
+                    self.block_tracker.acknowledge_finalized_batch(number);
                 }
             }
             let appended = self
                 .deposit_queue
-                .try_enqueue_sealed(header, events.portal_events.clone())
+                .try_enqueue_sealed(header, events.clone())
                 .wrap_err_with(|| {
                     format!(
                         "unexpected discontinuity while enqueueing L1 block {}",
                         anchor.number
                     )
                 })?;
-            if let Some(logs) = events.portal_logs {
-                self.block_tracker.record_with_portal_evidence(
-                    anchor,
-                    parent_hash,
-                    events.portal_events,
-                    logs,
-                )?;
-            } else {
-                self.block_tracker
-                    .record_with_portal_events(anchor, events.portal_events)?;
-            }
-            self.block_tracker.state.write().pending.remove(&number);
+            self.block_tracker
+                .record_observation(anchor, events, portal_evidence)?;
+            self.block_tracker.remove_pending_execution_block(number);
             if appended {
                 self.subscriber_metrics.blocks_enqueued.increment(1);
             }

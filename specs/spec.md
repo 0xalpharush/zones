@@ -408,8 +408,9 @@ The admin manages which TIP-20 tokens are available on the zone (see [Access Con
   Tempo anchors and buffered peer blocks. Historical catch-up requires an archive-capable L1
   endpoint. Historical execution replay and settlement ancestry are limited to 262,144 headers;
   larger gaps require operator recovery. Automatic recovery across a full 30-day production
-  freeze is not currently supported. Startup waits for a successful finalized pause-state read,
-  retrying and logging RPC failures without a retry limit. Storage-read retry defaults are unchanged.
+  freeze is not currently supported. Startup retries finalized pause-state RPC failures without a
+  limit; if Portal deployment has not finalized yet, the watcher continues checking after startup.
+  Storage-read retry defaults are unchanged.
   Finalized leadership, key rotation, token, and cache updates continue independently of the
   bounded execution queue while paused.
 - `resume()`: Allow the admin to resume those flows before the bounded pause expires. Resuming

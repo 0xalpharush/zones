@@ -62,7 +62,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tempo_alloy::TempoNetwork;
+use tempo_alloy::{TempoNetwork, rpc::TempoHeaderResponse};
 use tempo_evm::{TempoInvalidTransaction, consensus::TempoConsensus};
 use tempo_node::{
     DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
@@ -105,26 +105,29 @@ use zone_sequencer::{
 
 const PORTAL_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Refresh the production gate from the portal at the latest finalized Tempo block.
-async fn refresh_portal_pause(
+async fn finalized_header(
+    l1_provider: &DynProvider<TempoNetwork>,
+) -> eyre::Result<TempoHeaderResponse> {
+    l1_provider
+        .get_header_by_number(BlockNumberOrTag::Finalized)
+        .await?
+        .ok_or_else(|| eyre::eyre!("L1 finalized block is not available"))
+}
+
+async fn refresh_portal_pause_at(
     l1_provider: &DynProvider<TempoNetwork>,
     portal_address: Address,
     l1_block_tracker: &L1BlockTracker,
+    header: &TempoHeaderResponse,
 ) -> eyre::Result<()> {
-    let header = l1_provider
-        .get_header_by_number(BlockNumberOrTag::Finalized)
-        .await?
-        .ok_or_else(|| eyre::eyre!("L1 finalized block is not available"))?;
     let block_number = header.number();
     let block_id = alloy_rpc_types_eth::BlockId::hash_canonical(header.hash);
     let code = l1_provider
         .get_code_at(portal_address)
         .block_id(block_id)
         .await?;
-    // A newly deployed portal may exist at latest but not yet at the finalized checkpoint.
+    // Missing code before finalized deployment must not reopen a previously observed Portal.
     if code.is_empty() {
-        // Do not advance the watermark for an undeployed Portal. In particular, a missing-code
-        // response must never reopen a Portal whose deployment was already observed.
         return l1_block_tracker.validate_portal_absence();
     }
     let paused = ZonePortal::new(portal_address, l1_provider)
@@ -145,8 +148,18 @@ async fn refresh_portal_pause(
     Ok(())
 }
 
-/// Wait for a known finalized pause state before allowing node startup to continue.
-/// There is deliberately no retry limit: an RPC outage must not start an unguarded producer.
+/// Refresh the production gate from the portal at the latest finalized Tempo block.
+async fn refresh_portal_pause(
+    l1_provider: &DynProvider<TempoNetwork>,
+    portal_address: Address,
+    l1_block_tracker: &L1BlockTracker,
+) -> eyre::Result<()> {
+    let header = finalized_header(l1_provider).await?;
+    refresh_portal_pause_at(l1_provider, portal_address, l1_block_tracker, &header).await
+}
+
+/// Retry the initial finalized pause refresh before node startup. Missing code is accepted until
+/// Portal deployment finalizes; RPC failures retry without limit.
 async fn initialize_portal_pause(
     l1_provider: &DynProvider<TempoNetwork>,
     portal_address: Address,
@@ -171,11 +184,28 @@ async fn watch_portal_pause(
 ) {
     let mut interval = tokio::time::interval(PORTAL_PAUSE_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_checked = l1_block_tracker.portal_pause_snapshot();
     loop {
         interval.tick().await;
-        if let Err(err) =
-            refresh_portal_pause(&l1_provider, portal_address, &l1_block_tracker).await
-        {
+        let result = async {
+            let header = finalized_header(&l1_provider).await?;
+            let block = alloy_eips::NumHash::new(header.number(), header.hash);
+            if last_checked != Some(block) {
+                refresh_portal_pause_at(
+                    &l1_provider,
+                    portal_address,
+                    &l1_block_tracker,
+                    &header,
+                )
+                .await?;
+                if l1_block_tracker.portal_pause_snapshot() == Some(block) {
+                    last_checked = Some(block);
+                }
+            }
+            Ok::<_, eyre::Report>(())
+        }
+        .await;
+        if let Err(err) = result {
             warn!(
                 target: "zone::engine",
                 %err,
@@ -1329,16 +1359,16 @@ where
                 l1_provider,
             )
             .await?;
-        let attestation = AttestationContext::new(
-            attestation_domain,
+        let attestation = AttestationContext {
+            domain: attestation_domain,
             pinned_sequencer_set_version,
-            config.block_attestation_signer(),
-            config.block_attestation_addresses(),
-            AttestationStore::default(),
-            l1_provider.clone(),
+            signer: config.block_attestation_signer(),
+            addresses: config.block_attestation_addresses(),
+            store: AttestationStore::default(),
+            l1_provider: l1_provider.clone(),
             anchor_config,
             l1_block_tracker,
-        );
+        };
         let schedule = config.leadership();
         let local_ed25519_public_key = config.ed25519_public_key();
         let manifest = config.manifest().clone();
@@ -2118,7 +2148,6 @@ mod tests {
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use reth_chainspec::EthChainSpec;
     use reth_primitives_traits::Recovered;
-    use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_primitives::transaction::{
         AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
     };
@@ -2192,7 +2221,6 @@ mod tests {
         )));
     }
 
-    /// A mocked L1 provider plus a fresh tracker and portal address for the pause tests.
     fn pause_env() -> (Asserter, DynProvider<TempoNetwork>, L1BlockTracker, Address) {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
@@ -2204,6 +2232,15 @@ mod tests {
             L1BlockTracker::default(),
             Address::repeat_byte(0x11),
         )
+    }
+
+    async fn assert_refresh_failure_preserves_pause(
+        provider: &DynProvider<TempoNetwork>,
+        portal: Address,
+        tracker: &L1BlockTracker,
+    ) {
+        assert!(refresh_portal_pause(provider, portal, tracker).await.is_err());
+        assert!(tracker.portal_paused());
     }
 
     #[tokio::test]
@@ -2267,22 +2304,12 @@ mod tests {
 
         push_finalized_header(&asserter, 11);
         asserter.push_failure_msg("code lookup unavailable");
-        assert!(
-            refresh_portal_pause(&provider, portal, &tracker)
-                .await
-                .is_err()
-        );
-        assert!(tracker.portal_paused());
+        assert_refresh_failure_preserves_pause(&provider, portal, &tracker).await;
 
         push_finalized_header(&asserter, 11);
         asserter.push_success(&Bytes::from_static(&[0x00]));
         asserter.push_failure_msg("paused call unavailable");
-        assert!(
-            refresh_portal_pause(&provider, portal, &tracker)
-                .await
-                .is_err()
-        );
-        assert!(tracker.portal_paused());
+        assert_refresh_failure_preserves_pause(&provider, portal, &tracker).await;
         assert!(asserter.read_q().is_empty());
     }
 
@@ -2295,12 +2322,7 @@ mod tests {
             .unwrap();
         push_finalized_header(&asserter, 12);
         asserter.push_success(&Bytes::new());
-        assert!(
-            refresh_portal_pause(&provider, portal, &tracker)
-                .await
-                .is_err()
-        );
-        assert!(tracker.portal_paused());
+        assert_refresh_failure_preserves_pause(&provider, portal, &tracker).await;
         // A valid intermediate snapshot must still be accepted after the bad response.
         push_portal_pause_snapshot(&asserter, 11, false);
         refresh_portal_pause(&provider, portal, &tracker)
@@ -2314,6 +2336,7 @@ mod tests {
     async fn portal_pause_watcher_observes_automatic_expiry_without_an_event() {
         let (asserter, provider, tracker, portal) = pause_env();
         push_portal_pause_snapshot(&asserter, 10, true);
+        push_finalized_header(&asserter, 10);
         push_portal_pause_snapshot(&asserter, 11, false);
 
         refresh_portal_pause(&provider, portal, &tracker)

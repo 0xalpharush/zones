@@ -2454,6 +2454,7 @@ async fn observer_delivery_resumes_after_reconnect_without_duplicates() {
         let mut subscriber = test_subscriber_with_checkpoint(checkpoint);
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         subscriber.finalized_batch_submissions = Some(sender);
+        subscriber.config.retain_portal_evidence = true;
         if historical_replay {
             // Governance is outside the consumer's cache window when it observes this block.
             subscriber.block_tracker.initialize_consumed_through(0);
@@ -2461,6 +2462,7 @@ async fn observer_delivery_resumes_after_reconnect_without_duplicates() {
         let logs = (0..6)
             .map(|index| submission_log(subscriber.config.portal_address, index))
             .collect();
+        let expected_logs = logs.iter().map(|log| log.inner.clone()).collect();
         let (header, receipts) = block_with_logs(checkpoint, logs);
         let anchor = seal(header.clone()).num_hash();
         let rpc = Asserter::new();
@@ -2506,6 +2508,14 @@ async fn observer_delivery_resumes_after_reconnect_without_duplicates() {
         assert!(receiver.try_recv().is_err());
         assert_eq!(subscriber.block_tracker.latest(), Some(anchor));
         assert_eq!(subscriber.deposit_queue.last_enqueued(), Some(anchor));
+        let evidence = subscriber
+            .block_tracker
+            .authenticated_portal_logs(anchor)
+            .unwrap()
+            .expect("execution delivery must retain authenticated Portal evidence");
+        assert_eq!(evidence.block, anchor);
+        assert_eq!(evidence.parent_hash, checkpoint.hash);
+        assert_eq!(evidence.logs, expected_logs);
         // Reconnects reuse the in-flight block, including a block fetched during replay.
         assert!(rpc.read_q().is_empty());
     }
