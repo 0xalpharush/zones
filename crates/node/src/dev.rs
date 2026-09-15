@@ -13,7 +13,9 @@ use alloy_provider::{PendingTransactionBuilder, Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
 use tempo_alloy::TempoNetwork;
-use tempo_contracts::precompiles::{ITIP20, PATH_USD_ADDRESS};
+use tempo_contracts::precompiles::{
+    ITIP20, ITIP403Registry, PATH_USD_ADDRESS, TIP403_REGISTRY_ADDRESS,
+};
 use tempo_zone_contracts::{ZONE_FACTORY_ADDRESS, ZoneFactory};
 use zone_primitives::constants::zone_chain_id;
 use zone_sequencer::register_encryption_key;
@@ -103,6 +105,26 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         "ZoneFactory owner is {factory_owner}, but the configured dev key resolves to \
          {dev_address}; use the standard Tempo dev key or transfer factory ownership before \
          provisioning"
+    );
+    let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
+    let policy = registry.tokenTransferPolicyId(initial_token).call().await?;
+    if !policy.isSet {
+        let receipt = registry
+            .migrateTransferPolicyIds(vec![initial_token])
+            .send_sync()
+            .await?;
+        eyre::ensure!(
+            receipt.status(),
+            "initial token transfer-policy migration reverted"
+        );
+    }
+    eyre::ensure!(
+        registry
+            .tokenTransferPolicyId(initial_token)
+            .call()
+            .await?
+            .isSet,
+        "initial token transfer policy is not registered after migration"
     );
     // Anchor before createZone so the L1 subscriber replays the creation block,
     // including the initial TokenEnabled event emitted by the portal constructor.
